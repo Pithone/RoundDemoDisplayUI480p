@@ -35,6 +35,10 @@ namespace {
 constexpr uint32_t kTouchPollMs = 20;
 constexpr uint32_t kLongHoldWarningMs = 4000;
 constexpr uint32_t kLongHoldSleepMs = 5000;
+constexpr uint32_t kIgnoredTouchReleaseMs = 1500;
+constexpr uint32_t kPanelSleepTransitionDelayMs = 120;
+constexpr uint32_t kPanelCommandDelayMs = 20;
+constexpr uint32_t kDimBeforeSleepMs = 5U * 60U * 1000U;
 constexpr uint32_t kBeepMs = 90;
 constexpr int16_t kSwipeDistance = 65;
 constexpr int16_t kHoldMovementLimit = 20;
@@ -73,6 +77,7 @@ constexpr BackgroundColor kBackgroundColors[] = {
 esp_lcd_panel_handle_t panelHandle = nullptr;
 spi_device_handle_t panelCommandDevice = nullptr;
 lv_display_t* displayHandle = nullptr;
+lv_obj_t* sleepOverlay = nullptr;
 TaskHandle_t lvglTaskHandle = nullptr;
 void* frameBuffer0 = nullptr;
 void* frameBuffer1 = nullptr;
@@ -100,18 +105,17 @@ uint32_t touchPollAt = 0;
 uint32_t beepOffAt = 0;
 uint32_t lastInteractionAt = 0;
 uint32_t lastAutoRotateAt = 0;
+uint32_t ignoredTouchReleaseAt = 0;
 uint8_t selectedBrightness = board::kDefaultBrightness;
-uint8_t dimTimeoutSelection = 0;
-uint8_t returnTimeoutSelection = 0;
 uint8_t autoRotateSelection = 2;
+uint8_t autoSleepSelection = 2;
 size_t backgroundColorSelection = 0;
 std::string cardError;
 std::string imageError;
 
 lv_obj_t* brightnessSlider = nullptr;
-lv_obj_t* dimDropdown = nullptr;
-lv_obj_t* returnDropdown = nullptr;
 lv_obj_t* autoRotateDropdown = nullptr;
+lv_obj_t* autoSleepDropdown = nullptr;
 lv_obj_t* backgroundColorLabel = nullptr;
 
 constexpr uint16_t kDiagnosticColors[5] = {
@@ -367,13 +371,13 @@ bool readTouchRegister(uint16_t address, uint8_t* buffer, size_t length) {
     return true;
 }
 
-bool readGt911(int16_t& x, int16_t& y) {
+bool readGt911(int16_t& x, int16_t& y, bool& isDown) {
     uint8_t status = 0;
     if (!readTouchRegister(board::kTouchStatusRegister, &status, 1)) {
         return false;
     }
     if ((status & 0x80U) == 0) {
-        touchDown = false;
+        isDown = false;
         return true;
     }
 
@@ -388,9 +392,9 @@ bool readGt911(int16_t& x, int16_t& y) {
         y = static_cast<int16_t>(point[2] | (point[3] << 8));
         x = std::clamp<int16_t>(x, 0, board::kWidth - 1);
         y = std::clamp<int16_t>(y, 0, board::kHeight - 1);
-        touchDown = true;
+        isDown = true;
     } else {
-        touchDown = false;
+        isDown = false;
     }
 
     return writeTouchRegister(board::kTouchStatusRegister, 0);
@@ -457,6 +461,16 @@ void initializeLvgl() {
         LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(displayHandle, displayFlush);
     lv_display_set_flush_wait_cb(displayHandle, displayFlushWait);
+
+    sleepOverlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(sleepOverlay, board::kWidth, board::kHeight);
+    lv_obj_set_pos(sleepOverlay, 0, 0);
+    lv_obj_set_style_bg_color(sleepOverlay, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sleepOverlay, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sleepOverlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(sleepOverlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(sleepOverlay, 0, LV_PART_MAIN);
+    lv_obj_add_flag(sleepOverlay, LV_OBJ_FLAG_HIDDEN);
 
     const esp_lcd_rgb_panel_event_callbacks_t callbacks = {
         .on_frame_buf_complete = onFrameBufferComplete,
@@ -707,7 +721,6 @@ void loadPage(size_t page) {
     if (settingsOpen) {
         lv_obj_remove_flag(uiPages[currentPage].settings, LV_OBJ_FLAG_HIDDEN);
     }
-    noteInteraction();
 }
 
 void navigateNext() {
@@ -724,32 +737,58 @@ void navigatePrevious() {
     loadPage((currentPage + uiPages.size() - 1) % uiPages.size());
 }
 
-void enterSleep() {
+void enterSleep(const char* reason) {
     if (displaySleeping) {
         return;
     }
+    Serial.printf("[POWER] Entering sleep: %s\n", reason);
     if (beepActive) {
         setBuzzer(false);
         beepActive = false;
     }
+    lv_obj_remove_flag(sleepOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(sleepOverlay);
+    lv_refr_now(displayHandle);
+    setBrightness(0);
     if (!panelWrite(0x28)) {
         Serial.println("[ERROR] Could not send ST7701 display-off command");
     }
-    setBrightness(0);
+    delay(kPanelCommandDelayMs);
+    if (!panelWrite(0x10)) {
+        Serial.println("[ERROR] Could not send ST7701 sleep-in command");
+    }
+    delay(kPanelSleepTransitionDelayMs);
     displaySleeping = true;
     ignoreTouchUntilRelease = true;
-    Serial.println("[POWER] Display sleeping; touch the panel to wake");
+    ignoredTouchReleaseAt = 0;
+    gestureEligible = false;
+    holdEligible = false;
+    holdWarningPlayed = false;
+    Serial.println("[POWER] LCD in sleep mode; touch the panel to wake");
 }
 
 void wakeDisplay() {
     if (!displaySleeping) {
         return;
     }
+    if (!panelWrite(0x11)) {
+        Serial.println("[ERROR] Could not send ST7701 sleep-out command");
+        return;
+    }
+    delay(kPanelSleepTransitionDelayMs);
     if (!panelWrite(0x29)) {
         Serial.println("[ERROR] Could not send ST7701 display-on command");
+        return;
     }
+    lv_obj_add_flag(sleepOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(sleepOverlay);
+    lv_refr_now(displayHandle);
     displaySleeping = false;
     ignoreTouchUntilRelease = true;
+    ignoredTouchReleaseAt = 0;
+    gestureEligible = false;
+    holdEligible = false;
+    holdWarningPlayed = false;
     noteInteraction();
     setBrightness(selectedBrightness);
     Serial.println("[POWER] Display awake");
@@ -763,12 +802,38 @@ void pollTouchAndGestures(uint32_t now) {
 
     int16_t x = touchX;
     int16_t y = touchY;
-    if (!readGt911(x, y)) {
+    bool nextTouchDown = touchDown;
+    if (!readGt911(x, y, nextTouchDown)) {
         Serial.println("[TOUCH] GT911 read failed");
-        touchDown = false;
-    } else if (touchDown) {
-        touchX = x;
-        touchY = y;
+        gestureEligible = false;
+        holdEligible = false;
+        if (beepActive) {
+            setBuzzer(false);
+            beepActive = false;
+        }
+    } else {
+        touchDown = nextTouchDown;
+        if (touchDown) {
+            touchX = x;
+            touchY = y;
+        }
+    }
+
+    if (ignoreTouchUntilRelease) {
+        if (touchDown) {
+            ignoredTouchReleaseAt = 0;
+        } else {
+            if (ignoredTouchReleaseAt == 0) {
+                ignoredTouchReleaseAt = now;
+            } else if (now - ignoredTouchReleaseAt >=
+                       kIgnoredTouchReleaseMs) {
+                ignoreTouchUntilRelease = false;
+                ignoredTouchReleaseAt = 0;
+                gestureEligible = false;
+                holdEligible = false;
+                holdWarningPlayed = false;
+            }
+        }
     }
 
     if (touchDown && !previousTouchDown) {
@@ -806,8 +871,8 @@ void pollTouchAndGestures(uint32_t now) {
                 beepOffAt = now + kBeepMs;
                 holdWarningPlayed = true;
             }
-            if (heldFor >= kLongHoldSleepMs) {
-                enterSleep();
+            if (!settingsOpen && heldFor >= kLongHoldSleepMs) {
+                enterSleep("long touch");
             }
         }
     }
@@ -843,7 +908,6 @@ void pollTouchAndGestures(uint32_t now) {
         gestureEligible = false;
         holdEligible = false;
         holdWarningPlayed = false;
-        ignoreTouchUntilRelease = false;
     }
 
     previousTouchDown = touchDown;
@@ -865,22 +929,16 @@ void onBrightnessChanged(lv_event_t* event) {
     noteInteraction();
 }
 
-void onDimDropdownChanged(lv_event_t* event) {
-    dimDropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
-    dimTimeoutSelection = lv_dropdown_get_selected(dimDropdown);
-    noteInteraction();
-}
-
-void onReturnDropdownChanged(lv_event_t* event) {
-    returnDropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
-    returnTimeoutSelection = lv_dropdown_get_selected(returnDropdown);
-    noteInteraction();
-}
-
 void onAutoRotateDropdownChanged(lv_event_t* event) {
     autoRotateDropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
     autoRotateSelection = lv_dropdown_get_selected(autoRotateDropdown);
     lastAutoRotateAt = millis();
+    noteInteraction();
+}
+
+void onAutoSleepDropdownChanged(lv_event_t* event) {
+    autoSleepDropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    autoSleepSelection = lv_dropdown_get_selected(autoSleepDropdown);
     noteInteraction();
 }
 
@@ -963,30 +1021,22 @@ lv_obj_t* createSettingsPanel(lv_obj_t* screen) {
     lv_label_set_text(backgroundColorLabel,
                       kBackgroundColors[backgroundColorSelection].name);
 
-    addLabel(panel, "Auto dim", 166);
-    dimDropdown = lv_dropdown_create(panel);
-    lv_dropdown_set_options(dimDropdown, "Off\n30s\n60s\n120s");
-    lv_dropdown_set_selected(dimDropdown, dimTimeoutSelection);
-    lv_obj_set_width(dimDropdown, 170);
-    lv_obj_align(dimDropdown, LV_ALIGN_TOP_MID, 0, 188);
-    lv_obj_add_event_cb(dimDropdown, onDimDropdownChanged,
+    addLabel(panel, "Auto sleep", 166);
+    autoSleepDropdown = lv_dropdown_create(panel);
+    lv_dropdown_set_options(autoSleepDropdown, "Never\n30 min\n60 min\n120 min");
+    lv_dropdown_set_selected(autoSleepDropdown, autoSleepSelection);
+    lv_obj_set_width(autoSleepDropdown, 170);
+    lv_obj_align(autoSleepDropdown, LV_ALIGN_TOP_MID, 0, 188);
+    lv_obj_add_event_cb(autoSleepDropdown, onAutoSleepDropdownChanged,
                         LV_EVENT_VALUE_CHANGED, nullptr);
 
-    addLabel(panel, "Return home", 230);
-    returnDropdown = lv_dropdown_create(panel);
-    lv_dropdown_set_options(returnDropdown, "Off\n15s\n30s\n60s");
-    lv_dropdown_set_selected(returnDropdown, returnTimeoutSelection);
-    lv_obj_set_width(returnDropdown, 170);
-    lv_obj_align(returnDropdown, LV_ALIGN_TOP_MID, 0, 252);
-    lv_obj_add_event_cb(returnDropdown, onReturnDropdownChanged,
-                        LV_EVENT_VALUE_CHANGED, nullptr);
-
-    addLabel(panel, "Auto rotate", 294);
+    addLabel(panel, "Auto rotate", 230);
     autoRotateDropdown = lv_dropdown_create(panel);
-    lv_dropdown_set_options(autoRotateDropdown, "Off\n10s\n5s");
+    lv_dropdown_set_options(autoRotateDropdown,
+                            "Off\n10s\n5s\nHome 15s\nHome 30s\nHome 60s");
     lv_dropdown_set_selected(autoRotateDropdown, autoRotateSelection);
     lv_obj_set_width(autoRotateDropdown, 170);
-    lv_obj_align(autoRotateDropdown, LV_ALIGN_TOP_MID, 0, 316);
+    lv_obj_align(autoRotateDropdown, LV_ALIGN_TOP_MID, 0, 252);
     lv_obj_add_event_cb(autoRotateDropdown, onAutoRotateDropdownChanged,
                         LV_EVENT_VALUE_CHANGED, nullptr);
     return panel;
@@ -1051,27 +1101,41 @@ void processInactivity(uint32_t now) {
         return;
     }
 
-    static constexpr uint16_t dimSeconds[] = {0, 30, 60, 120};
-    static constexpr uint16_t returnSeconds[] = {0, 15, 30, 60};
-    static constexpr uint16_t autoRotateSeconds[] = {0, 10, 5};
+    static constexpr uint16_t autoActionSeconds[] = {0, 10, 5, 15, 30, 60};
+    static constexpr uint16_t autoSleepMinutes[] = {0, 30, 60, 120};
     const uint32_t idleFor = now - lastInteractionAt;
-    const uint16_t dimSecondsSelected = dimSeconds[dimTimeoutSelection];
-    if (dimSecondsSelected > 0 &&
-        idleFor >= static_cast<uint32_t>(dimSecondsSelected) * 1000U &&
-        !dimmed) {
-        setBrightness(static_cast<uint8_t>(selectedBrightness / 2U));
-        dimmed = true;
-        Serial.println("[POWER] Auto-dim active");
+    const uint16_t autoSleepMinutesSelected =
+        autoSleepMinutes[autoSleepSelection];
+    if (autoSleepMinutesSelected > 0 &&
+        idleFor >= static_cast<uint32_t>(autoSleepMinutesSelected) *
+                      60U * 1000U) {
+        enterSleep("inactivity timeout");
+        return;
     }
 
-    const uint16_t returnSecondsSelected = returnSeconds[returnTimeoutSelection];
-    if (returnSecondsSelected > 0 && currentPage != 0 &&
-        idleFor >= static_cast<uint32_t>(returnSecondsSelected) * 1000U) {
+    const uint32_t autoSleepMs =
+        static_cast<uint32_t>(autoSleepMinutesSelected) * 60U * 1000U;
+    const uint32_t dimAfterMs =
+        autoSleepMs > 0 ? autoSleepMs - kDimBeforeSleepMs
+                        : 60U * 60U * 1000U;
+    if (idleFor >= dimAfterMs && !dimmed) {
+        setBrightness(static_cast<uint8_t>(selectedBrightness / 2U));
+        dimmed = true;
+        Serial.println(autoSleepMs > 0
+                           ? "[POWER] Dimming before scheduled sleep"
+                           : "[POWER] Auto-dim active; sleep disabled");
+    }
+
+    const bool returnHomeSelected = autoRotateSelection >= 3;
+    const uint16_t returnHomeSeconds =
+        returnHomeSelected ? autoActionSeconds[autoRotateSelection] : 0;
+    if (returnHomeSeconds > 0 && currentPage != 0 &&
+        idleFor >= static_cast<uint32_t>(returnHomeSeconds) * 1000U) {
         loadPage(0);
     }
 
     const uint16_t autoRotateSecondsSelected =
-        autoRotateSeconds[autoRotateSelection];
+        autoRotateSelection < 3 ? autoActionSeconds[autoRotateSelection] : 0;
     if (!settingsOpen && uiImages.size() > 1 &&
         autoRotateSecondsSelected > 0 &&
         now - lastAutoRotateAt >=
@@ -1187,13 +1251,14 @@ void setup() {
     lastInteractionAt = millis();
     Serial.println("[APP] Ready; swipe horizontally to change screens");
     Serial.println("[APP] Hold still for 4s to beep and 5s to sleep");
+    Serial.println("[APP] Auto sleep defaults to 60 minutes; dims 5 minutes before");
     Serial.println("[APP] Swipe down near center to open settings");
 }
 
 void loop() {
     const uint32_t now = millis();
     pollTouchAndGestures(now);
-    processInactivity(now);
+    processInactivity(millis());
     const uint32_t nextTimerMs = lv_timer_handler();
     const uint32_t sleepMs = std::clamp<uint32_t>(nextTimerMs, 5, 20);
     delay(sleepMs);

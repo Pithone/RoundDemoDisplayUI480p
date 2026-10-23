@@ -80,16 +80,21 @@ fallback screen with the cause.
   are open.
 - Horizontal navigation swipes require less than 55 pixels of vertical
   movement to avoid triggering navigation accidentally.
-- The settings menu controls brightness (20–255), auto-dim (off/30/60/120 s),
-  return-to-home (off/15/30/60 s), and automatic image rotation (off/10/5 s).
-  Defaults are 90% brightness and 5-second automatic rotation. Automatic
-  rotation pauses while settings are open.
+- The settings menu controls brightness (20–255), auto-sleep
+  (never/30/60/120 min), and automatic image rotation (off/10/5 s) or
+  return-home (15/30/60 s). Auto-sleep defaults to 60 minutes and dims the
+  display to half brightness for its final 5 minutes. With sleep set to Never,
+  the display still dims to half brightness after 60 minutes but stays awake.
+  Brightness defaults to 90% and automatic rotation to 5 seconds. Automatic
+  rotation pauses while settings are open. Inactivity timeouts count user
+  input, not automatic page changes.
 - Background color can be cycled with the settings arrows through white, black,
   50% gray, orange (`RGB 233, 131, 0`), and teal (`RGB 0, 130, 148`).
-- Hold still for 4 seconds for a short beep; at 5 seconds the panel is put into
-  display-off mode and the backlight is turned off. A fresh touch wakes it and
-  restores the selected brightness. The GT911 remains active so it can detect
-  wake touches.
+- Hold still for 4 seconds for a short beep; at 5 seconds the ST7701 receives
+  a full black RGB frame before display-off and sleep-in commands, then the
+  backlight is turned off. A fresh touch wakes the controller, restores the
+  screen, and returns to the selected brightness. The GT911 remains active so
+  it can detect wake touches.
 
 The firmware only scans and reads image files from the SD card.
 
