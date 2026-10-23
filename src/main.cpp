@@ -35,6 +35,7 @@ namespace {
 constexpr uint32_t kTouchPollMs = 20;
 constexpr uint32_t kLongHoldWarningMs = 4000;
 constexpr uint32_t kLongHoldSleepMs = 5000;
+constexpr uint32_t kIgnoredTouchReleaseMs = 1500;
 constexpr uint32_t kPanelSleepTransitionDelayMs = 120;
 constexpr uint32_t kPanelCommandDelayMs = 20;
 constexpr uint32_t kDimBeforeSleepMs = 5U * 60U * 1000U;
@@ -104,6 +105,7 @@ uint32_t touchPollAt = 0;
 uint32_t beepOffAt = 0;
 uint32_t lastInteractionAt = 0;
 uint32_t lastAutoRotateAt = 0;
+uint32_t ignoredTouchReleaseAt = 0;
 uint8_t selectedBrightness = board::kDefaultBrightness;
 uint8_t autoRotateSelection = 2;
 uint8_t autoSleepSelection = 2;
@@ -369,13 +371,13 @@ bool readTouchRegister(uint16_t address, uint8_t* buffer, size_t length) {
     return true;
 }
 
-bool readGt911(int16_t& x, int16_t& y) {
+bool readGt911(int16_t& x, int16_t& y, bool& isDown) {
     uint8_t status = 0;
     if (!readTouchRegister(board::kTouchStatusRegister, &status, 1)) {
         return false;
     }
     if ((status & 0x80U) == 0) {
-        touchDown = false;
+        isDown = false;
         return true;
     }
 
@@ -390,9 +392,9 @@ bool readGt911(int16_t& x, int16_t& y) {
         y = static_cast<int16_t>(point[2] | (point[3] << 8));
         x = std::clamp<int16_t>(x, 0, board::kWidth - 1);
         y = std::clamp<int16_t>(y, 0, board::kHeight - 1);
-        touchDown = true;
+        isDown = true;
     } else {
-        touchDown = false;
+        isDown = false;
     }
 
     return writeTouchRegister(board::kTouchStatusRegister, 0);
@@ -735,10 +737,11 @@ void navigatePrevious() {
     loadPage((currentPage + uiPages.size() - 1) % uiPages.size());
 }
 
-void enterSleep() {
+void enterSleep(const char* reason) {
     if (displaySleeping) {
         return;
     }
+    Serial.printf("[POWER] Entering sleep: %s\n", reason);
     if (beepActive) {
         setBuzzer(false);
         beepActive = false;
@@ -757,6 +760,10 @@ void enterSleep() {
     delay(kPanelSleepTransitionDelayMs);
     displaySleeping = true;
     ignoreTouchUntilRelease = true;
+    ignoredTouchReleaseAt = 0;
+    gestureEligible = false;
+    holdEligible = false;
+    holdWarningPlayed = false;
     Serial.println("[POWER] LCD in sleep mode; touch the panel to wake");
 }
 
@@ -778,6 +785,10 @@ void wakeDisplay() {
     lv_refr_now(displayHandle);
     displaySleeping = false;
     ignoreTouchUntilRelease = true;
+    ignoredTouchReleaseAt = 0;
+    gestureEligible = false;
+    holdEligible = false;
+    holdWarningPlayed = false;
     noteInteraction();
     setBrightness(selectedBrightness);
     Serial.println("[POWER] Display awake");
@@ -791,12 +802,38 @@ void pollTouchAndGestures(uint32_t now) {
 
     int16_t x = touchX;
     int16_t y = touchY;
-    if (!readGt911(x, y)) {
+    bool nextTouchDown = touchDown;
+    if (!readGt911(x, y, nextTouchDown)) {
         Serial.println("[TOUCH] GT911 read failed");
-        touchDown = false;
-    } else if (touchDown) {
-        touchX = x;
-        touchY = y;
+        gestureEligible = false;
+        holdEligible = false;
+        if (beepActive) {
+            setBuzzer(false);
+            beepActive = false;
+        }
+    } else {
+        touchDown = nextTouchDown;
+        if (touchDown) {
+            touchX = x;
+            touchY = y;
+        }
+    }
+
+    if (ignoreTouchUntilRelease) {
+        if (touchDown) {
+            ignoredTouchReleaseAt = 0;
+        } else {
+            if (ignoredTouchReleaseAt == 0) {
+                ignoredTouchReleaseAt = now;
+            } else if (now - ignoredTouchReleaseAt >=
+                       kIgnoredTouchReleaseMs) {
+                ignoreTouchUntilRelease = false;
+                ignoredTouchReleaseAt = 0;
+                gestureEligible = false;
+                holdEligible = false;
+                holdWarningPlayed = false;
+            }
+        }
     }
 
     if (touchDown && !previousTouchDown) {
@@ -834,8 +871,8 @@ void pollTouchAndGestures(uint32_t now) {
                 beepOffAt = now + kBeepMs;
                 holdWarningPlayed = true;
             }
-            if (heldFor >= kLongHoldSleepMs) {
-                enterSleep();
+            if (!settingsOpen && heldFor >= kLongHoldSleepMs) {
+                enterSleep("long touch");
             }
         }
     }
@@ -871,7 +908,6 @@ void pollTouchAndGestures(uint32_t now) {
         gestureEligible = false;
         holdEligible = false;
         holdWarningPlayed = false;
-        ignoreTouchUntilRelease = false;
     }
 
     previousTouchDown = touchDown;
@@ -1073,7 +1109,7 @@ void processInactivity(uint32_t now) {
     if (autoSleepMinutesSelected > 0 &&
         idleFor >= static_cast<uint32_t>(autoSleepMinutesSelected) *
                       60U * 1000U) {
-        enterSleep();
+        enterSleep("inactivity timeout");
         return;
     }
 
@@ -1222,7 +1258,7 @@ void setup() {
 void loop() {
     const uint32_t now = millis();
     pollTouchAndGestures(now);
-    processInactivity(now);
+    processInactivity(millis());
     const uint32_t nextTimerMs = lv_timer_handler();
     const uint32_t sleepMs = std::clamp<uint32_t>(nextTimerMs, 5, 20);
     delay(sleepMs);
